@@ -1,34 +1,65 @@
 import json
 import os
-from datetime import datetime
-from config import LOG_FILE
+import uuid
+from datetime import datetime, timezone
+
+from config import LOG_FILE, LLM_MODEL, VALID_TIERS
+
+try:
+    from safety import CLASSIFIER_PROMPT_VERSION
+except Exception:  # keep the logger usable even if safety.py fails to import
+    CLASSIFIER_PROMPT_VERSION = "unknown"
+
+QUESTION_MAX_CHARS = 300
+RESPONSE_PREVIEW_CHARS = 200
+CONSOLE_QUESTION_CHARS = 60
 
 
-def log_interaction(question: str, tier: str, response: str) -> None:
+def _truncate(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit]
+
+
+def log_interaction(question: str, tier: str, response: str, reason: str = "") -> None:
     """
-    Append a structured record of this interaction to the audit log.
+    Append a structured record of this interaction to the audit log (LOG_FILE, JSONL).
 
-    TODO — Milestone 3:
+    Design is documented in specs/auditor-spec.md. One JSON object per line, written with
+    json.dumps (never indent=) plus "\\n", in append mode. Creates logs/ if missing.
 
-    Before writing any code, complete specs/auditor-spec.md. The key decisions
-    are what fields to log, how much of the question and response to include,
-    and how to handle the logs/ directory not existing yet.
+    `reason` is optional (default "") so the original 3-argument call still works;
+    app.py passes the classifier's reason so each record says WHY the tier was chosen.
 
-    Each record should be a JSON object written as a single line to LOG_FILE
-    (defined in config.py as "logs/audit.jsonl").
-
-    Required fields:
-      - "timestamp"        : ISO 8601 datetime string
-      - "tier"             : the safety tier assigned to this question
-      - "question"         : the user's question (truncate to 300 chars if longer)
-      - "response_preview" : first 200 characters of the response
-
-    If the logs/ directory doesn't exist, create it before writing.
-
-    Also print a one-line summary to the terminal so you can see logged
-    interactions in real time without opening the file:
-      e.g. [LOGGED] tier=caution | "How do I replace a faucet?" → 47 chars
-
-    Design your log entry in specs/auditor-spec.md before implementing here.
+    Prints a one-line summary:
+      [LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 1243 chars
     """
-    pass
+    question = question or ""
+    response = response or ""
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "interaction_id": uuid.uuid4().hex[:12],
+        "tier": tier,
+        "tier_valid": tier in VALID_TIERS,
+        "classifier_reason": _truncate(reason, QUESTION_MAX_CHARS),
+        "question": _truncate(question, QUESTION_MAX_CHARS),
+        "question_chars": len(question),
+        "response_preview": _truncate(response, RESPONSE_PREVIEW_CHARS),
+        "response_chars": len(response),
+        "model": LLM_MODEL,
+        "classifier_prompt_version": CLASSIFIER_PROMPT_VERSION,
+    }
+
+    try:
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        # Never crash the user's request because logging failed, but make it loud.
+        print(f"[AUDIT ERROR] Could not write to {LOG_FILE}: {e!r} | record={json.dumps(record)}")
+        return
+
+    short_q = question if len(question) <= CONSOLE_QUESTION_CHARS else question[:CONSOLE_QUESTION_CHARS - 1] + "…"
+    print(f'[LOGGED] tier={tier} | "{short_q}" → {len(response)} chars')

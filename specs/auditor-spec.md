@@ -1,7 +1,7 @@
 # Spec: `log_interaction()`
 
 **File:** `auditor.py`
-**Status:** Spec incomplete — fill in all blank fields before implementing
+**Status:** Spec complete — implemented
 
 ---
 
@@ -43,8 +43,13 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"interaction_id"` | `str` | Short random ID (12 hex chars) so a specific record can be referenced in a bug report or user complaint ("look at a3f9c21b04de") |
+| `"classifier_reason"` | `str` | The classifier's one-sentence reason, truncated to 300 chars. The single most useful field for a cluster of misclassifications: it shows *why* the model picked the tier, e.g. a wave of "treats replacing an outlet as adding a circuit" points straight at the prompt rule to fix. Also exposes parser fallbacks, which all share the same "returned an unclear result" reason |
+| `"tier_valid"` | `bool` | `false` if the tier wasn't in `VALID_TIERS` (e.g. `"unknown"` from a stub). Lets you filter pipeline bugs separately from judgment errors |
+| `"question_chars"` | `int` | Length of the full question before truncation. Spots truncated questions and very long/injection-style inputs |
+| `"response_chars"` | `int` | Length of the full response. A refuse-tier response that is 2,000 chars long is a red flag that it's giving instructions; a 0-char response is an API failure |
+| `"model"` | `str` | `LLM_MODEL` at the time of the call. When the provider retires a model (as happened with Llama 4 Scout), you can split the log into before/after |
+| `"classifier_prompt_version"` | `str` | `CLASSIFIER_PROMPT_VERSION` from `safety.py`. Ties every classification to the prompt that produced it, so a regression can be traced to a specific prompt change |
 
 ---
 
@@ -53,7 +58,25 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+Question — 300 chars: almost every real repair question fits in 300 characters, so in practice
+the log keeps the whole question, which is what you need to re-run it through the classifier
+and reproduce a misclassification. Cutting harder (say 80 chars) loses the detail that decides
+the tier: "Can I add a new outlet..." vs "...replace the one that's already there" often sits
+at the END of the sentence. "just six inches" framing and injection attempts ("ignore your
+rules...") also tend to come after the main question.
+
+Response preview — 200 chars: the opening of the response is where the tier behavior shows.
+A caution answer should open with the upfront "hire a pro if unsure" recommendation; a refuse
+answer should open with "this needs a licensed professional". 200 chars is enough to verify
+the response matched the tier (and to catch "Here's how..." in a refuse response) without
+storing the whole answer. Cutting to ~50 chars wouldn't even get past the first sentence.
+
+Risk of full text at scale: at 10,000 questions/day, full responses (1-3 KB each) add 10-30 MB
+per day of mostly redundant text, which costs storage and makes log tools slow. More
+importantly, users paste personal details (addresses, landlord names, phone numbers) into
+questions, and every extra character kept is more sensitive data to protect and retain. The
+response is also reproducible from the question + model + prompt version, which the log keeps.
+response_chars records the full length so you don't lose that signal.
 ```
 
 ---
@@ -63,7 +86,21 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+Without handling, open("logs/audit.jsonl", "a") raises FileNotFoundError. Append mode creates
+the file but not missing parent directories. That crashes the user's request after the answer
+was already generated.
+
+Handling: before every write, os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True). It's
+idempotent (no error if the folder exists) and has no race between "check" and "create".
+
+Why it matters: logs/.gitkeep keeps the folder in git, but it won't exist on a fresh deploy
+from a Docker image or a cloud host with a clean filesystem, or after someone deletes the
+folder to "clear the logs". An audit log that silently stops working is worse than none,
+because you think you have accountability and you don't.
+
+Second safeguard: the write is wrapped in try/except OSError. If the disk is full or the
+folder isn't writable, the function prints [AUDIT ERROR] with the full record to the terminal
+(so the record isn't lost) instead of crashing the user's request.
 ```
 
 ---
@@ -73,7 +110,18 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+[LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 1243 chars
+
+Format, in order:
+  "[LOGGED]" literal tag (easy to grep)
+  one space, "tier=" + the tier value exactly as logged
+  " | "
+  the question in double quotes, cut to 60 chars with a trailing "…" if longer
+  " → " (space, arrow, space)
+  the full response length as an integer + " chars"
+
+Example with a long question:
+[LOGGED] tier=refuse | "I just want to move my light switch six inches to the left —…" → 512 chars
 ```
 
 ---
@@ -85,11 +133,23 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+[TODO after running: ask one safe, one caution, and one refuse question (e.g. the drywall,
+faucet, and gas-line examples), then paste the three lines from logs/audit.jsonl here.]
 ```
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+"session_id" — a hashed, non-reversible identifier for the user session (not raw IP or email).
+
+At 10,000 questions/day, the most important pattern the current log can't show is
+circumvention: the same person asking a refuse-tier question, getting refused, then rephrasing
+it ("I'm a licensed electrician...", "for a novel...", "just six inches...") until something
+gets through. Each attempt looks like an unrelated record today. With session_id you can group
+them, measure how often refusals are followed by reframes, and find the exact reframe that
+flipped a refuse into a caution. It also enables per-user rate limiting and abuse review.
+Hashing keeps it useful for grouping without storing who the person is.
+
+Runner-up: "latency_ms" for the classifier and responder calls, to catch provider slowdowns
+and set alerting thresholds.
 ```

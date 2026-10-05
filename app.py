@@ -99,7 +99,7 @@ def handle_question(question: str):
     response = generate_safe_response(question, tier)
 
     # Milestone 3: log
-    log_interaction(question, tier, response)
+    log_interaction(question, tier, response, reason=reason)
 
     return _tier_html(tier, reason), response
 
